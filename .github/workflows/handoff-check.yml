@@ -1,0 +1,51 @@
+name: HANDOFF Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  validate:
+    if: contains(github.event.pull_request.body, 'Closes #')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      pull-requests: write
+    steps:
+      - name: Validate HANDOFF completion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Extract issue number from PR body
+          ISSUE_NUM=$(echo "$PR_BODY" | grep -oP 'Closes #\K\d+' | head -1)
+          if [ -z "$ISSUE_NUM" ]; then
+            echo "No issue reference found, skipping"
+            exit 0
+          fi
+
+          echo "Checking HANDOFF for Issue #$ISSUE_NUM..."
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUM" --repo "${{ github.repository }}" --json body --jq '.body')
+
+          ERRORS=""
+
+          # Check status is 🟢 Complete
+          if ! echo "$ISSUE_BODY" | grep -q '🟢 Complete'; then
+            ERRORS="${ERRORS}- Status is not set to 🟢 Complete\n"
+          fi
+
+          # Check Completed section is non-empty
+          COMPLETED=$(echo "$ISSUE_BODY" | sed -n '/^## Completed/,/^## /p' | sed '1d;$d' | sed '/^$/d')
+          if [ -z "$COMPLETED" ]; then
+            ERRORS="${ERRORS}- **Completed** section is empty\n"
+          fi
+
+          if [ -n "$ERRORS" ]; then
+            COMMENT="## ❌ HANDOFF Validation Failed\n\nIssue #$ISSUE_NUM has incomplete HANDOFF:\n\n${ERRORS}\nPlease update the Issue body before merging."
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(echo -e "$COMMENT")"
+            echo "HANDOFF validation failed"
+            exit 1
+          fi
+
+          echo "HANDOFF validation passed"

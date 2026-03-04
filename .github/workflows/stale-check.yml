@@ -1,0 +1,54 @@
+name: Stale Check
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # every 6 hours
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Detect stale in-progress issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOW=$(date +%s)
+          WARN_THRESHOLD=86400   # 24h
+          FAIL_THRESHOLD=259200  # 72h
+
+          # Output compact JSON: one object per line (--jq -c doesn't work, use @json trick)
+          gh issue list --repo "${{ github.repository }}" --state open --limit 200 \
+            --json number,body,updatedAt --jq \
+            '[.[] | select(.body | test("🟡 In Progress"))] | .[] | [.number, .updatedAt] | @tsv' \
+          | while IFS=$'\t' read -r NUMBER UPDATED; do
+
+            UPDATED_TS=$(date -d "$UPDATED" +%s 2>/dev/null || echo 0)
+            AGE=$(( NOW - UPDATED_TS ))
+
+            if [ "$AGE" -gt "$FAIL_THRESHOLD" ]; then
+              echo "Issue #$NUMBER: stale >72h, marking failed"
+              gh issue comment "$NUMBER" --repo "${{ github.repository }}" \
+                --body "$(printf '## 🕐 Stale Issue Detected\n\nThis issue has been in 🟡 In Progress for over 72 hours with no updates.\n\nMarking as 🔴 Failed. Re-add `agent:ready` label to retry.')"
+
+              # Safe status replacement via python to avoid sed injection
+              BODY=$(gh issue view "$NUMBER" --repo "${{ github.repository }}" --json body --jq '.body')
+              NEW_BODY=$(python3 -c "import sys; print(sys.stdin.read().replace('🟡 In Progress', '🔴 Failed'))" <<< "$BODY")
+              gh issue edit "$NUMBER" --repo "${{ github.repository }}" --body "$NEW_BODY"
+              gh issue label add "$NUMBER" --repo "${{ github.repository }}" "agent:failed" || true
+              gh issue label remove "$NUMBER" --repo "${{ github.repository }}" "agent:ready" || true
+
+            elif [ "$AGE" -gt "$WARN_THRESHOLD" ]; then
+              # Only warn once: check if we already commented
+              EXISTING=$(gh issue view "$NUMBER" --repo "${{ github.repository }}" --json comments \
+                --jq '[.comments[] | select(.body | test("Stale Issue Warning"))] | length')
+              if [ "$EXISTING" -eq 0 ]; then
+                HOURS=$(( AGE / 3600 ))
+                echo "Issue #$NUMBER: stale ${HOURS}h, warning"
+                gh issue comment "$NUMBER" --repo "${{ github.repository }}" \
+                  --body "$(printf '## ⚠️ Stale Issue Warning\n\nThis issue has been in 🟡 In Progress for %d hours with no updates.\n\nIf the agent is still running, this is expected. Otherwise, consider re-triggering with `agent:ready`.' "$HOURS")"
+              fi
+            fi
+          done
