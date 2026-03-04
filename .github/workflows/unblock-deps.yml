@@ -1,0 +1,52 @@
+name: Unblock Dependencies
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  unblock:
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.body, 'Closes #')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Re-trigger unblocked issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Extract completed issue number from PR body
+          CLOSED_NUM=$(echo "${{ github.event.pull_request.body }}" | grep -oP 'Closes #\K\d+' | head -1)
+          if [ -z "$CLOSED_NUM" ]; then
+            exit 0
+          fi
+          echo "Issue #$CLOSED_NUM completed via merge"
+
+          # Find open issues that depend on this one
+          CANDIDATES=$(gh issue list --repo "${{ github.repository }}" --state open --limit 100 --json number,body --jq \
+            ".[] | select(.body | test(\"Depends on #$CLOSED_NUM(\\\\D|$)\")) | .number")
+
+          for ISSUE_NUM in $CANDIDATES; do
+            echo "Checking Issue #$ISSUE_NUM..."
+            ISSUE_BODY=$(gh issue view "$ISSUE_NUM" --repo "${{ github.repository }}" --json body --jq '.body')
+
+            # Extract all dependency numbers
+            ALL_DEPS=$(echo "$ISSUE_BODY" | grep -oP 'Depends on #\K\d+' || true)
+            ALL_COMPLETE=true
+
+            for DEP in $ALL_DEPS; do
+              DEP_BODY=$(gh issue view "$DEP" --repo "${{ github.repository }}" --json body --jq '.body' 2>/dev/null || true)
+              if ! echo "$DEP_BODY" | grep -q '🟢 Complete'; then
+                echo "  → Still blocked by #$DEP"
+                ALL_COMPLETE=false
+                break
+              fi
+            done
+
+            if [ "$ALL_COMPLETE" = true ]; then
+              echo "  → All dependencies complete, adding agent:ready"
+              gh issue comment "$ISSUE_NUM" --repo "${{ github.repository }}" \
+                --body "## ✅ Dependencies Resolved\n\nAll dependencies are now complete. Triggering agent."
+              gh issue edit "$ISSUE_NUM" --repo "${{ github.repository }}" --add-label "agent:ready"
+            fi
+          done

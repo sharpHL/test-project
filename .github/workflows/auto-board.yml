@@ -1,0 +1,16 @@
+name: Auto Add to Board
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  add-to-board:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/add-to-project@v1.0.2
+        with:
+          # Replace YOUR_BOARD_URL with your GitHub Project Board URL
+          # e.g. https://github.com/users/USERNAME/projects/1
+          project-url: YOUR_BOARD_URL
+          github-token: ${{ secrets.BOARD_TOKEN }}

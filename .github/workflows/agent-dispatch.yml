@@ -1,0 +1,136 @@
+name: Agent Dispatch
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to retry"
+        required: true
+        type: number
+
+concurrency:
+  group: agent-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'agent:ready'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Resolve issue number
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ISSUE_NUM="${{ inputs.issue_number }}"
+            # Clean up failed state for retry
+            gh issue label remove "$ISSUE_NUM" --repo "${{ github.repository }}" "agent:failed" 2>/dev/null || true
+          else
+            ISSUE_NUM="${{ github.event.issue.number }}"
+          fi
+          echo "number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Check dependencies
+        id: deps
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.issue.outputs.number }}
+        run: |
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUM" --repo "${{ github.repository }}" --json body --jq '.body')
+          DEPS=$(echo "$ISSUE_BODY" | grep -oP 'Depends on #\K\d+' || true)
+          if [ -z "$DEPS" ]; then
+            echo "No dependencies found"
+            echo "blocked=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BLOCKED=""
+          for DEP in $DEPS; do
+            DEP_BODY=$(gh issue view "$DEP" --repo "${{ github.repository }}" --json body --jq '.body')
+            if ! echo "$DEP_BODY" | grep -q '🟢 Complete'; then
+              BLOCKED="${BLOCKED}#${DEP} "
+            fi
+          done
+          if [ -n "$BLOCKED" ]; then
+            gh issue comment "$ISSUE_NUM" --repo "${{ github.repository }}" \
+              --body "## ⏸️ Blocked\n\nWaiting on dependencies: ${BLOCKED}\n\nWill retry when dependencies are complete."
+            gh issue label remove "$ISSUE_NUM" --repo "${{ github.repository }}" "agent:ready" || true
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "All dependencies complete"
+          echo "blocked=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.deps.outputs.blocked != 'true'
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      - name: Load agent prompt
+        if: steps.deps.outputs.blocked != 'true'
+        id: prompt
+        run: |
+          CONTENT=$(cat .github/agent-prompt.md)
+          CONTENT="${CONTENT//__ISSUE_NUMBER__/${{ steps.issue.outputs.number }}}"
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "content<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "$CONTENT" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude Code Agent
+        if: steps.deps.outputs.blocked != 'true'
+        uses: anthropics/claude-code-action@v1.0.66
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          label_trigger: "agent:ready"
+          claude_args: "--dangerously-skip-permissions"
+          prompt: ${{ steps.prompt.outputs.content }}
+
+      - name: Handle success
+        if: success() && steps.deps.outputs.blocked != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.issue.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Find the PR created by the agent
+          PR_URL=$(gh pr list --repo "${{ github.repository }}" --state open \
+            --json url,body --jq ".[] | select(.body | test(\"Closes #$ISSUE_NUM\")) | .url" | head -1)
+          if [ -n "$PR_URL" ]; then
+            gh issue comment "$ISSUE_NUM" --repo "${{ github.repository }}" \
+              --body "## ✅ Agent Completed\n\nPR created: $PR_URL\n\nWorkflow run: $RUN_URL"
+          else
+            gh issue comment "$ISSUE_NUM" --repo "${{ github.repository }}" \
+              --body "## ✅ Agent Completed\n\nWorkflow run: $RUN_URL\n\nNo PR found — the agent may have determined no changes were needed."
+          fi
+          gh issue label remove "$ISSUE_NUM" --repo "${{ github.repository }}" "agent:ready" || true
+
+      - name: Handle failure
+        if: failure() && steps.deps.outputs.blocked != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ steps.issue.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue comment "$ISSUE_NUM" --repo "${{ github.repository }}" \
+            --body "$(printf '## ❌ Agent Failed\n\nWorkflow run failed: %s\n\nCheck logs for details.' "$RUN_URL")"
+          BODY=$(gh issue view "$ISSUE_NUM" --repo "${{ github.repository }}" --json body --jq '.body')
+          NEW_BODY=$(python3 -c "import sys; print(sys.stdin.read().replace('🟡 In Progress', '🔴 Failed'))" <<< "$BODY")
+          gh issue edit "$ISSUE_NUM" --repo "${{ github.repository }}" --body "$NEW_BODY"
+          gh issue label add "$ISSUE_NUM" --repo "${{ github.repository }}" "agent:failed" || true
+          gh issue label remove "$ISSUE_NUM" --repo "${{ github.repository }}" "agent:ready" || true
