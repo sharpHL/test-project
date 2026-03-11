@@ -77,9 +77,15 @@ jobs:
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
+        if: steps.deps.outputs.blocked != 'true'
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        if: steps.deps.outputs.blocked != 'true'
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
       - name: Load agent prompt
         if: steps.deps.outputs.blocked != 'true'
